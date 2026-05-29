@@ -1,1 +1,1460 @@
+import os
+import json
+import zipfile
+from collections import defaultdict
 
+import numpy as np
+import nrrd
+import matplotlib.pyplot as plt
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader, Subset
+
+from scipy.ndimage import (
+    binary_erosion,
+    distance_transform_edt,
+    generate_binary_structure
+)
+
+NUM_CLASSES = 16
+BACKGROUND_CLASS = 0
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+USE_INSTANCE_NORM = True
+USE_AMP = torch.cuda.is_available()
+
+DEFAULT_SPACING_2D = (2.5, 2.5)
+
+NSD_TOLERANCE_MM = 2.5
+
+EXCLUDE_BACKGROUND_IN_METRICS = True
+COMPUTE_SURFACE_METRICS_IN_EVERY_VAL = False  # al principio mejor False
+
+DATA_ROOT = "/kaggle/input/datasets/purificacionamarilla/dataset-2p5d-bases-final/DATASET_2p5D_bases_FINAL"
+
+IMG_TRAIN_ROOT = os.path.join(DATA_ROOT, "images", "train")
+MASK_TRAIN_ROOT = os.path.join(DATA_ROOT, "masks", "train")
+
+IMG_TEST_ROOT = os.path.join(DATA_ROOT, "images", "test")
+MASK_TEST_ROOT = os.path.join(DATA_ROOT, "masks", "test")
+
+WORK_DIR = "/kaggle/working"
+
+print("Device:", DEVICE)
+print("Train images:", IMG_TRAIN_ROOT)
+print("Train masks:", MASK_TRAIN_ROOT)
+print("Test images:", IMG_TEST_ROOT)
+print("Test masks:", MASK_TEST_ROOT)
+
+def build_triplet_indices(i, n_slices):
+    prev_i = max(i - 1, 0)
+    next_i = min(i + 1, n_slices - 1)
+    return prev_i, i, next_i
+
+
+
+
+class NRRD_TorsoDataset(Dataset):
+    def __init__(self, img_path, mask_path, plane="axial"):
+        self.samples = []
+        self.patients = []
+        self.plane = plane
+
+        for patient in sorted(os.listdir(img_path)):
+            p_img_dir = os.path.join(img_path, patient, plane)
+            p_mask_dir = os.path.join(mask_path, patient, plane)
+
+            if not os.path.isdir(p_img_dir) or not os.path.isdir(p_mask_dir):
+                continue
+
+            slices = sorted([f for f in os.listdir(p_img_dir) if f.endswith(".nrrd")])
+            if len(slices) < 1:
+                continue
+
+            base_idx_before = len(self.samples)
+
+            for i in range(len(slices)):
+                prev_i, center_i, next_i = build_triplet_indices(i, len(slices))
+
+                triplet = [
+                    os.path.join(p_img_dir, slices[prev_i]),
+                    os.path.join(p_img_dir, slices[center_i]),
+                    os.path.join(p_img_dir, slices[next_i]),
+                ]
+                m_path = os.path.join(p_mask_dir, slices[center_i])
+
+                if os.path.exists(m_path):
+                    self.samples.append((triplet, m_path, patient, slices[center_i]))
+
+            if len(self.samples) > base_idx_before:
+                self.patients.append(patient)
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        img_triplet, mask_path, patient, slice_name = self.samples[idx]
+
+        imgs = []
+        for p in img_triplet:
+            data, _ = nrrd.read(p)
+            imgs.append(torch.from_numpy(data.astype(np.float32)).unsqueeze(0))
+
+        image_tensor = torch.cat(imgs, dim=0)
+
+        m_data, _ = nrrd.read(mask_path)
+        mask_tensor = torch.from_numpy(m_data.astype(np.int64))
+
+        return image_tensor, mask_tensor, patient, slice_name
+
+dataset = NRRD_TorsoDataset(
+    img_path=IMG_TRAIN_ROOT,
+    mask_path=MASK_TRAIN_ROOT,
+    plane="axial"
+)
+
+print("Pacientes detectados:", len(dataset.patients))
+print("Primeros pacientes:", dataset.patients[:5])
+print("Total samples:", len(dataset))
+
+x, y, p, s = dataset[0]
+print("Paciente:", p)
+print("Slice:", s)
+print("Shape imagen:", x.shape)
+print("Shape máscara:", y.shape)
+print("Labels máscara:", torch.unique(y))
+
+# =========================================================
+# 🧱 MODELO (UNet 2.5D, 3 slices)
+# =========================================================
+class DoubleConv(nn.Module):
+    def __init__(self, in_ch, out_ch, use_inorm=True, dropout_p=0.0):
+        super().__init__()
+
+        Norm = (lambda c: nn.InstanceNorm2d(c, affine=True)) if use_inorm else (lambda c: nn.BatchNorm2d(c))
+
+        layers = [
+            nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False),
+            Norm(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False),
+            Norm(out_ch),
+            nn.ReLU(inplace=True),
+        ]
+
+        if dropout_p > 0:
+            layers.insert(3, nn.Dropout2d(dropout_p))
+
+        self.conv = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.conv(x)
+
+
+class UNet2_5D_Multiclass(nn.Module):
+    def __init__(self, n_channels=3, n_classes=15, use_inorm=True):
+        super().__init__()
+
+        self.inc = DoubleConv(n_channels, 64, use_inorm=use_inorm)
+        self.down1 = nn.MaxPool2d(2)
+        self.conv1 = DoubleConv(64, 128, use_inorm=use_inorm)
+
+        self.down2 = nn.MaxPool2d(2)
+        self.conv2 = DoubleConv(128, 256, use_inorm=use_inorm)
+
+        self.down3 = nn.MaxPool2d(2)
+        self.conv3 = DoubleConv(256, 512, use_inorm=use_inorm, dropout_p=0.15)
+
+        self.up1 = nn.ConvTranspose2d(512, 256, 2, stride=2)
+        self.dec1 = DoubleConv(512, 256, use_inorm=use_inorm)
+
+        self.up2 = nn.ConvTranspose2d(256, 128, 2, stride=2)
+        self.dec2 = DoubleConv(256, 128, use_inorm=use_inorm)
+
+        self.up3 = nn.ConvTranspose2d(128, 64, 2, stride=2)
+        self.dec3 = DoubleConv(128, 64, use_inorm=use_inorm)
+
+        self.outc = nn.Conv2d(64, n_classes, 1)
+
+    def forward(self, x):
+        x1 = self.inc(x)
+        x2 = self.conv1(self.down1(x1))
+        x3 = self.conv2(self.down2(x2))
+        x4 = self.conv3(self.down3(x3))
+
+        y = self.up1(x4)
+        y = torch.cat([y, x3], dim=1)
+        y = self.dec1(y)
+
+        y = self.up2(y)
+        y = torch.cat([y, x2], dim=1)
+        y = self.dec2(y)
+
+        y = self.up3(y)
+        y = torch.cat([y, x1], dim=1)
+        y = self.dec3(y)
+
+        return self.outc(y)  # logits [B,C,H,W]
+
+
+# =========================================================
+# 🧩 UTILIDAD: PADDING DE BORDES PARA TRIPLETES 2.5D
+# =========================================================
+def build_triplet_indices(i, n_slices):
+    """
+    Para slice i, devuelve índices [prev, center, next]
+    usando padding por repetición en los bordes.
+    """
+    prev_i = max(i - 1, 0)
+    next_i = min(i + 1, n_slices - 1)
+    return prev_i, i, next_i
+
+model = UNet2_5D_Multiclass(
+    n_channels=3,
+    n_classes=NUM_CLASSES,
+    use_inorm=USE_INSTANCE_NORM
+).to(DEVICE)
+
+x_batch = x.unsqueeze(0).to(DEVICE)
+logits = model(x_batch)
+
+print("Output shape:", logits.shape)
+
+# =========================================================
+# 📂 DATASET TRAIN/VAL (.NRRD) CON BORDES INCLUIDOS
+# =========================================================
+class NRRD_TorsoDataset(Dataset):
+    """
+    Estructura esperada:
+      img_path/paciente/axial/*.nrrd
+      mask_path/paciente/axial/*.nrrd
+
+    Ahora incluye TODOS los slices, también 0 y N-1, usando padding
+    por repetición para generar el triplete 2.5D.
+    """
+    def __init__(self, img_path, mask_path, plane="axial"):
+        self.samples = []
+        self.patients = []
+        self.plane = plane
+
+        for patient in sorted(os.listdir(img_path)):
+            p_img_dir = os.path.join(img_path, patient, plane)
+            p_mask_dir = os.path.join(mask_path, patient, plane)
+
+            if not os.path.isdir(p_img_dir) or not os.path.isdir(p_mask_dir):
+                continue
+
+            slices = sorted([f for f in os.listdir(p_img_dir) if f.endswith(".nrrd")])
+            if len(slices) < 1:
+                continue
+
+            base_idx_before = len(self.samples)
+
+            for i in range(len(slices)):
+                prev_i, center_i, next_i = build_triplet_indices(i, len(slices))
+
+                triplet = [
+                    os.path.join(p_img_dir, slices[prev_i]),
+                    os.path.join(p_img_dir, slices[center_i]),
+                    os.path.join(p_img_dir, slices[next_i]),
+                ]
+                m_path = os.path.join(p_mask_dir, slices[center_i])
+
+                if os.path.exists(m_path):
+                    self.samples.append((triplet, m_path, patient, slices[center_i]))
+
+            if len(self.samples) > base_idx_before:
+                self.patients.append(patient)
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        img_triplet, mask_path, patient, slice_name = self.samples[idx]
+
+        imgs = []
+        for p in img_triplet:
+            data, _ = nrrd.read(p)
+            imgs.append(torch.from_numpy(data.astype(np.float32)).unsqueeze(0))
+
+        image_tensor = torch.cat(imgs, dim=0)  # [3,H,W]
+
+        m_data, _ = nrrd.read(mask_path)
+        mask_tensor = torch.from_numpy(m_data.astype(np.int64))  # [H,W]
+
+        return image_tensor, mask_tensor, patient, slice_name
+
+
+# =========================================================
+# 🧮 LOSSES
+# =========================================================
+import torch
+import torch.nn.functional as F
+
+
+def dice_loss_softmax_multiclass_ignore_absent_weighted(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    num_classes: int,
+    class_weights: torch.Tensor = None,
+    include_background: bool = False,
+    smooth: float = 1e-5,
+):
+    """
+    Dice multiclass:
+    - con softmax
+    - ignorando clases ausentes en el batch (según GT)
+    - con ponderación opcional por clase
+
+    logits:  [B, C, H, W]
+    targets: [B, H, W]
+    class_weights: [C] o None
+    """
+    probs = F.softmax(logits, dim=1)  # [B,C,H,W]
+    t = F.one_hot(targets, num_classes=num_classes).permute(0, 3, 1, 2).float()
+
+    if include_background:
+        class_range = range(num_classes)
+    else:
+        class_range = range(1, num_classes)
+
+    dice_values = []
+    used_weights = []
+
+    if class_weights is not None:
+        class_weights = class_weights.to(device=logits.device, dtype=logits.dtype)
+
+    for c in class_range:
+        p_c = probs[:, c, :, :]
+        t_c = t[:, c, :, :]
+
+        # ignorar clases ausentes en GT en todo el batch
+        gt_pixels = t_c.sum()
+        if gt_pixels.item() == 0:
+            continue
+
+        inter = (p_c * t_c).sum()
+        denom = p_c.sum() + t_c.sum()
+        dice_c = (2.0 * inter + smooth) / (denom + smooth)
+
+        dice_values.append(dice_c)
+
+        if class_weights is not None:
+            used_weights.append(class_weights[c])
+        else:
+            used_weights.append(torch.tensor(1.0, device=logits.device, dtype=logits.dtype))
+
+    if len(dice_values) == 0:
+        return torch.tensor(0.0, device=logits.device, dtype=logits.dtype)
+
+    dice_values = torch.stack(dice_values)      # [K]
+    used_weights = torch.stack(used_weights)    # [K]
+
+    # media ponderada sobre las clases presentes
+    dice_mean = (dice_values * used_weights).sum() / used_weights.sum().clamp_min(smooth)
+
+    return 1.0 - dice_mean
+
+def make_class_weights(num_classes: int,
+                       weight_class_4: float = 2.0,
+                       weight_class_9: float = 3.0,
+                       background_weight: float = 1.0):
+    """
+    Crea un vector de pesos por clase.
+    Por defecto todas pesan 1, salvo las clases 4 y 9.
+    """
+    weights = torch.ones(num_classes, dtype=torch.float32)
+    weights[0] = background_weight
+    weights[4] = weight_class_4
+    weights[9] = weight_class_9
+    return weights
+
+
+@torch.no_grad()
+def compute_class_weights_from_dataset(dataset: Dataset, num_classes: int, max_samples: int = None):
+    counts = torch.zeros(num_classes, dtype=torch.float64)
+    n = len(dataset) if max_samples is None else min(len(dataset), max_samples)
+
+    for i in range(n):
+        item = dataset[i]
+        _, mask, _, _ = item
+        bc = torch.bincount(mask.reshape(-1), minlength=num_classes).to(torch.float64)
+        counts += bc
+
+    freq = counts / counts.sum().clamp_min(1.0)
+
+    weights = 1.0 / torch.sqrt(freq.clamp_min(1e-10))
+    weights = weights / weights.mean()
+    weights = torch.clamp(weights, 0.25, 10.0)
+    return weights.float()
+
+
+# =========================================================
+# 📏 MÉTRICAS
+# =========================================================
+def safe_div(n, d):
+    return n / d if d != 0 else np.nan
+
+
+def class_range_for_metrics(num_classes, exclude_background=True):
+    return list(range(1, num_classes)) if exclude_background else list(range(num_classes))
+
+
+def get_binary_masks(pred, target, cls):
+    pred_c = (pred == cls)
+    target_c = (target == cls)
+    return pred_c, target_c
+
+
+def dice_score_binary(pred_c, target_c):
+    pred_sum = pred_c.sum()
+    target_sum = target_c.sum()
+
+    if pred_sum == 0 and target_sum == 0:
+        return np.nan
+
+    inter = np.logical_and(pred_c, target_c).sum()
+    return (2.0 * inter) / (pred_sum + target_sum)
+
+
+def precision_binary(pred_c, target_c):
+    tp = np.logical_and(pred_c, target_c).sum()
+    fp = np.logical_and(pred_c, np.logical_not(target_c)).sum()
+
+    if pred_c.sum() == 0 and target_c.sum() == 0:
+        return np.nan
+
+    return safe_div(tp, tp + fp)
+
+
+def recall_binary(pred_c, target_c):
+    tp = np.logical_and(pred_c, target_c).sum()
+    fn = np.logical_and(np.logical_not(pred_c), target_c).sum()
+
+    if pred_c.sum() == 0 and target_c.sum() == 0:
+        return np.nan
+
+    return safe_div(tp, tp + fn)
+
+
+def volumetric_similarity_binary(pred_c, target_c):
+    vp = pred_c.sum()
+    vg = target_c.sum()
+
+    if vp == 0 and vg == 0:
+        return np.nan
+
+    return 1.0 - (abs(vp - vg) / (vp + vg))
+
+
+def get_mask_surface(mask):
+    structure = generate_binary_structure(mask.ndim, 1)
+
+    if mask.sum() == 0:
+        return np.zeros_like(mask, dtype=bool)
+
+    eroded = binary_erosion(mask, structure=structure, border_value=0)
+    surface = np.logical_xor(mask, eroded)
+    return surface
+
+
+def surface_distances(pred_c, target_c, spacing=(1.0, 1.0)):
+    pred_c = pred_c.astype(bool)
+    target_c = target_c.astype(bool)
+
+    if pred_c.sum() == 0 and target_c.sum() == 0:
+        return None, None
+    if pred_c.sum() == 0 or target_c.sum() == 0:
+        return None, None
+
+    pred_surface = get_mask_surface(pred_c)
+    target_surface = get_mask_surface(target_c)
+
+    dt_target = distance_transform_edt(~target_surface, sampling=spacing)
+    dt_pred = distance_transform_edt(~pred_surface, sampling=spacing)
+
+    pred_to_target = dt_target[pred_surface]
+    target_to_pred = dt_pred[target_surface]
+
+    return pred_to_target, target_to_pred
+
+
+def hd95_binary(pred_c, target_c, spacing=(1.0, 1.0)):
+    d1, d2 = surface_distances(pred_c, target_c, spacing=spacing)
+    if d1 is None or d2 is None:
+        return np.nan
+
+    all_d = np.concatenate([d1, d2], axis=0)
+    if all_d.size == 0:
+        return np.nan
+
+    return np.percentile(all_d, 95)
+
+def nsd_binary(pred_c, target_c, spacing=(1.0, 1.0), tolerance_mm=2.5):
+    d1, d2 = surface_distances(pred_c, target_c, spacing=spacing)
+
+    if d1 is None or d2 is None:
+        return np.nan
+
+    n_pred_surface = len(d1)
+    n_target_surface = len(d2)
+
+    if n_pred_surface == 0 and n_target_surface == 0:
+        return np.nan
+    if n_pred_surface + n_target_surface == 0:
+        return np.nan
+
+    pred_close = np.sum(d1 <= tolerance_mm)
+    target_close = np.sum(d2 <= tolerance_mm)
+
+    return (pred_close + target_close) / (n_pred_surface + n_target_surface)
+
+
+def compute_metrics_for_single_pair(pred, target, num_classes, spacing=(2.5, 2.5), exclude_background=True, nsd_tolerance_mm=2.5):
+    pred = np.asarray(pred)
+    target = np.asarray(target)
+
+    classes = class_range_for_metrics(num_classes, exclude_background=exclude_background)
+
+    result = {
+        "dice": {},
+        "hd95": {},
+        "nsd": {},
+        "precision": {},
+        "recall": {},
+        "vs": {},
+        "support_gt": {},
+        "support_pred": {},
+    }
+
+    for c in classes:
+        pred_c, target_c = get_binary_masks(pred, target, c)
+
+        result["dice"][c] = dice_score_binary(pred_c, target_c)
+        result["hd95"][c] = hd95_binary(pred_c, target_c, spacing=spacing)
+        result["nsd"][c] = nsd_binary(pred_c, target_c, spacing=spacing,tolerance_mm=nsd_tolerance_mm)
+        result["precision"][c] = precision_binary(pred_c, target_c)
+        result["recall"][c] = recall_binary(pred_c, target_c)
+        result["vs"][c] = volumetric_similarity_binary(pred_c, target_c)
+
+        result["support_gt"][c] = int(target_c.sum())
+        result["support_pred"][c] = int(pred_c.sum())
+
+    return result
+
+
+def init_metric_accumulator(num_classes, exclude_background=True):
+    classes = class_range_for_metrics(num_classes, exclude_background=exclude_background)
+    acc = {
+        "dice": {c: [] for c in classes},
+        "hd95": {c: [] for c in classes},
+        "nsd": {c: [] for c in classes},
+        "precision": {c: [] for c in classes},
+        "recall": {c: [] for c in classes},
+        "vs": {c: [] for c in classes},
+        "support_gt_sum": {c: 0 for c in classes},
+        "support_pred_sum": {c: 0 for c in classes},
+        "n_valid": {c: 0 for c in classes},
+    }
+    return acc
+
+
+def update_metric_accumulator(acc, pair_metrics):
+    classes = list(pair_metrics["dice"].keys())
+
+    for c in classes:
+        for metric_name in ["dice", "hd95", "nsd", "precision", "recall", "vs"]:
+            value = pair_metrics[metric_name][c]
+            if not np.isnan(value):
+                acc[metric_name][c].append(float(value))
+
+        acc["support_gt_sum"][c] += int(pair_metrics["support_gt"][c])
+        acc["support_pred_sum"][c] += int(pair_metrics["support_pred"][c])
+
+        if pair_metrics["support_gt"][c] > 0 or pair_metrics["support_pred"][c] > 0:
+            acc["n_valid"][c] += 1
+
+
+def finalize_metric_accumulator(acc):
+    summary = {}
+
+    for metric_name in ["dice", "hd95", "nsd", "precision", "recall", "vs"]:
+        summary[metric_name] = {}
+        for c, values in acc[metric_name].items():
+            summary[metric_name][c] = float(np.nanmean(values)) if len(values) > 0 else np.nan
+
+    summary["support_gt_sum"] = acc["support_gt_sum"]
+    summary["support_pred_sum"] = acc["support_pred_sum"]
+    summary["n_valid"] = acc["n_valid"]
+
+    macro = {}
+    for metric_name in ["dice", "hd95", "nsd", "precision", "recall", "vs"]:
+        vals = [v for v in summary[metric_name].values() if not np.isnan(v)]
+        macro[f"m{metric_name}"] = float(np.mean(vals)) if len(vals) > 0 else np.nan
+
+    summary["macro"] = macro
+    return summary
+
+
+def print_metric_summary(summary, title="Resumen métricas"):
+    print("\n" + "=" * 80)
+    print(title)
+    print("=" * 80)
+
+    classes = sorted(summary["dice"].keys())
+
+    header = (
+        f"{'Clase':<8}"
+        f"{'Dice':>10}"
+        f"{'HD95':>12}"
+        f"{'NSD':>12}"
+        f"{'Prec':>10}"
+        f"{'Rec':>10}"
+        f"{'VS':>10}"
+        f"{'GTvox':>12}"
+        f"{'PRvox':>12}"
+        f"{'Nval':>8}"
+    )
+    print(header)
+    print("-" * len(header))
+
+    for c in classes:
+        print(
+            f"{c:<8}"
+            f"{summary['dice'][c]:>10.4f}"
+            f"{summary['hd95'][c]:>12.4f}"
+            f"{summary['nsd'][c]:>12.4f}"
+            f"{summary['precision'][c]:>10.4f}"
+            f"{summary['recall'][c]:>10.4f}"
+            f"{summary['vs'][c]:>10.4f}"
+            f"{summary['support_gt_sum'][c]:>12}"
+            f"{summary['support_pred_sum'][c]:>12}"
+            f"{summary['n_valid'][c]:>8}"
+        )
+
+    print("-" * len(header))
+    print(
+        f"{'MACRO':<8}"
+        f"{summary['macro']['mdice']:>10.4f}"
+        f"{summary['macro']['mhd95']:>12.4f}"
+        f"{summary['macro']['mnsd']:>12.4f}"
+        f"{summary['macro']['mprecision']:>10.4f}"
+        f"{summary['macro']['mrecall']:>10.4f}"
+        f"{summary['macro']['mvs']:>10.4f}"
+    )
+    print("=" * 80 + "\n")
+
+
+def save_metrics_json(metrics_summary, out_path):
+    serializable = {
+        "dice": {str(k): v for k, v in metrics_summary["dice"].items()},
+        "hd95": {str(k): v for k, v in metrics_summary["hd95"].items()},
+        "nsd": {str(k): v for k, v in metrics_summary["nsd"].items()},
+        "precision": {str(k): v for k, v in metrics_summary["precision"].items()},
+        "recall": {str(k): v for k, v in metrics_summary["recall"].items()},
+        "vs": {str(k): v for k, v in metrics_summary["vs"].items()},
+        "support_gt_sum": {str(k): v for k, v in metrics_summary["support_gt_sum"].items()},
+        "support_pred_sum": {str(k): v for k, v in metrics_summary["support_pred_sum"].items()},
+        "n_valid": {str(k): v for k, v in metrics_summary["n_valid"].items()},
+        "macro": metrics_summary["macro"],
+    }
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(serializable, f, indent=2, ensure_ascii=False)
+
+# =========================================================
+# 🚀 TRAIN / VALIDATION
+# =========================================================
+class EarlyStopping:
+    def __init__(self, patience=10, min_delta=1e-4, mode="min"):
+        """
+        mode='min'  -> mejora si la métrica baja (ej. val_loss)
+        mode='max'  -> mejora si la métrica sube (ej. mDice)
+        """
+        self.patience = patience
+        self.min_delta = min_delta
+        self.mode = mode
+
+        self.best_value = None
+        self.counter = 0
+        self.should_stop = False
+
+    def step(self, current_value):
+        if self.best_value is None:
+            self.best_value = current_value
+            self.counter = 0
+            return True  # hubo mejora inicial
+
+        if self.mode == "min":
+            improved = current_value < (self.best_value - self.min_delta)
+        elif self.mode == "max":
+            improved = current_value > (self.best_value + self.min_delta)
+        else:
+            raise ValueError("mode debe ser 'min' o 'max'")
+
+        if improved:
+            self.best_value = current_value
+            self.counter = 0
+            return True
+        else:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.should_stop = True
+            return False
+
+
+def train_one_epoch(model, loader, optimizer, ce_criterion, device,
+                    num_classes, scaler, use_amp,
+                    class_weights=None,
+                    dice_weight=1.0, ce_weight=1.0,
+                    grad_clip=1.0):
+
+    model.train()
+    running = 0.0
+
+    for batch_idx, (data, target, _patients, _slice_names) in enumerate(loader):
+        data = data.to(device, non_blocking=True)
+        target = target.to(device, non_blocking=True)
+
+        optimizer.zero_grad(set_to_none=True)
+
+        with torch.cuda.amp.autocast(enabled=use_amp):
+            logits = model(data)
+
+            loss_ce = ce_criterion(logits, target)
+
+            loss_dice = dice_loss_softmax_multiclass_ignore_absent_weighted(
+                logits,
+                target,
+                num_classes=num_classes,
+                class_weights=class_weights,
+                include_background=False
+            )
+
+            loss = ce_weight * loss_ce + dice_weight * loss_dice
+
+        scaler.scale(loss).backward()
+
+        if grad_clip is not None:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+
+        scaler.step(optimizer)
+        scaler.update()
+
+        running += loss.item()
+
+    return running / len(loader)
+
+
+@torch.no_grad()
+def validate_one_epoch(model, loader, ce_criterion, device, num_classes, use_amp,
+                       class_weights=None,
+                       dice_weight=1.0, ce_weight=1.0,
+                       compute_surface_metrics=True,
+                       spacing=DEFAULT_SPACING_2D,
+                       nsd_tolerance_mm=NSD_TOLERANCE_MM):
+
+    model.eval()
+    running = 0.0
+
+    acc = init_metric_accumulator(
+        num_classes=num_classes,
+        exclude_background=EXCLUDE_BACKGROUND_IN_METRICS
+    )
+
+    for data, target, _patients, _slice_names in loader:
+        data = data.to(device, non_blocking=True)
+        target = target.to(device, non_blocking=True)
+
+        with torch.cuda.amp.autocast(enabled=use_amp):
+            logits = model(data)
+
+            loss_ce = ce_criterion(logits, target)
+
+            loss_dice = dice_loss_softmax_multiclass_ignore_absent_weighted(
+                logits,
+                target,
+                num_classes=num_classes,
+                class_weights=class_weights,
+                include_background=False
+            )
+
+            loss = ce_weight * loss_ce + dice_weight * loss_dice
+
+        running += loss.item()
+
+        pred = torch.argmax(logits, dim=1).cpu().numpy()
+        target_np = target.cpu().numpy()
+
+        for b in range(pred.shape[0]):
+            pm = compute_metrics_for_single_pair(
+                pred=pred[b],
+                target=target_np[b],
+                num_classes=num_classes,
+                spacing=spacing,
+                exclude_background=EXCLUDE_BACKGROUND_IN_METRICS,
+                nsd_tolerance_mm=nsd_tolerance_mm
+            )
+
+            if not compute_surface_metrics:
+                for c in pm["hd95"]:
+                    pm["hd95"][c] = np.nan
+                    pm["nsd"][c] = np.nan
+
+            update_metric_accumulator(acc, pm)
+
+    summary = finalize_metric_accumulator(acc)
+
+    return {
+        "val_loss": running / max(1, len(loader)),
+        "metrics_summary": summary
+    }
+
+
+def build_patient_folds(dataset, num_folds=4, patients_per_fold=10, seed=42):
+    patient_to_indices = defaultdict(list)
+
+    for idx, (_, _, patient, _slice_name) in enumerate(dataset.samples):
+        patient_to_indices[patient].append(idx)
+
+    patients = sorted(patient_to_indices.keys())
+    rng = np.random.RandomState(seed)
+    rng.shuffle(patients)
+
+    expected_patients = num_folds * patients_per_fold
+    if len(patients) != expected_patients:
+        raise ValueError(
+            f"Se esperaban exactamente {expected_patients} pacientes "
+            f"({num_folds} folds x {patients_per_fold} pacientes), "
+            f"pero hay {len(patients)}."
+        )
+
+    folds = []
+    for k in range(num_folds):
+        start = k * patients_per_fold
+        end = (k + 1) * patients_per_fold
+
+        val_patients = set(patients[start:end])
+        train_patients = set(patients) - val_patients
+
+        train_idx = [i for p in train_patients for i in patient_to_indices[p]]
+        val_idx = [i for p in val_patients for i in patient_to_indices[p]]
+
+        folds.append({
+            "fold": k + 1,
+            "train_patients": sorted(train_patients),
+            "val_patients": sorted(val_patients),
+            "train_idx": train_idx,
+            "val_idx": val_idx,
+        })
+
+    return folds
+
+
+def run_4fold_cross_validation(dataset, device, num_classes, use_instance_norm,
+                               epochs=50, batch_size=8, num_workers=4, seed=42,
+                               use_early_stopping=True, early_stopping_patience=10,
+                               early_stopping_min_delta=1e-4):
+    folds = build_patient_folds(
+        dataset=dataset,
+        num_folds=4,
+        patients_per_fold=10,
+        seed=seed
+    )
+
+    all_fold_results = []
+
+    for fold_info in folds:
+        fold_id = fold_info["fold"]
+
+        print("\n" + "=" * 70)
+        print(f"FOLD {fold_id}/4")
+        print(f"Train patients: {len(fold_info['train_patients'])}")
+        print(f"Val patients:   {len(fold_info['val_patients'])}")
+        print("=" * 70)
+
+        train_ds = Subset(dataset, fold_info["train_idx"])
+        val_ds = Subset(dataset, fold_info["val_idx"])
+
+        class_weights = make_class_weights(
+            num_classes=num_classes,
+            weight_class_4=2.0,
+            weight_class_9=3.0,
+            background_weight=1.0
+        )
+
+        ce_criterion = nn.CrossEntropyLoss(weight=class_weights.to(device))
+
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=True
+        )
+
+        val_loader = DataLoader(
+            val_ds,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=True
+        )
+
+        model = UNet2_5D_Multiclass(
+            n_channels=3,
+            n_classes=num_classes,
+            use_inorm=use_instance_norm
+        ).to(device)
+
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=2e-4,
+            weight_decay=1e-4
+        )
+
+        scaler = torch.cuda.amp.GradScaler(enabled=USE_AMP)
+
+        best_val_mdice = -float("inf")
+        best_metrics_summary = None
+
+        early_stopper = EarlyStopping(
+            patience=early_stopping_patience,
+            min_delta=early_stopping_min_delta,
+            mode="max"
+        )
+
+        history = {
+            "train_loss": [],
+            "val_loss": [],
+            "mdice": [],
+            "mhd95": [],
+            "mnsd": [],
+            "mprecision": [],
+            "mrecall": [],
+            "mvs": [],
+        }
+
+        for epoch in range(1, epochs + 1):
+            print(f"\n=== Fold {fold_id} | Epoch {epoch}/{epochs} ===")
+
+            train_loss = train_one_epoch(
+                model=model,
+                loader=train_loader,
+                optimizer=optimizer,
+                ce_criterion=ce_criterion,
+                device=device,
+                num_classes=num_classes,
+                scaler=scaler,
+                use_amp=USE_AMP,
+                class_weights=class_weights,
+                ce_weight=1.0,
+                dice_weight=1.0,
+                grad_clip=1.0
+            )
+
+            val_out = validate_one_epoch(
+                model=model,
+                loader=val_loader,
+                ce_criterion=ce_criterion,
+                device=device,
+                num_classes=num_classes,
+                use_amp=USE_AMP,
+                class_weights=class_weights,
+                dice_weight=1.0,
+                ce_weight=1.0,
+                compute_surface_metrics=COMPUTE_SURFACE_METRICS_IN_EVERY_VAL,
+                spacing=DEFAULT_SPACING_2D,
+                nsd_tolerance_mm=NSD_TOLERANCE_MM
+            )
+
+            val_loss = val_out["val_loss"]
+            metrics_summary = val_out["metrics_summary"]
+            val_mdice = metrics_summary["macro"]["mdice"]
+
+            history["train_loss"].append(train_loss)
+            history["val_loss"].append(val_loss)
+            history["mdice"].append(val_mdice)
+            history["mhd95"].append(metrics_summary["macro"]["mhd95"])
+            history["mnsd"].append(metrics_summary["macro"]["mnsd"])
+            history["mprecision"].append(metrics_summary["macro"]["mprecision"])
+            history["mrecall"].append(metrics_summary["macro"]["mrecall"])
+            history["mvs"].append(metrics_summary["macro"]["mvs"])
+
+            print(f"Train loss: {train_loss:.4f}")
+            print(f"Val loss:   {val_loss:.4f}")
+            print(f"mDice:      {val_mdice:.4f}")
+            print(f"mHD95:      {metrics_summary['macro']['mhd95']:.4f}")
+            print(f"mNSD:       {metrics_summary['macro']['mnsd']:.4f}")
+            print(f"mPrecision: {metrics_summary['macro']['mprecision']:.4f}")
+            print(f"mRecall:    {metrics_summary['macro']['mrecall']:.4f}")
+            print(f"mVS:        {metrics_summary['macro']['mvs']:.4f}")
+
+            improved_for_saving = val_mdice > (best_val_mdice + early_stopping_min_delta)
+
+            if improved_for_saving:
+                best_val_mdice = val_mdice
+                best_metrics_summary = metrics_summary
+
+                torch.save(model.state_dict(), f"best_model_fold_{fold_id}.pth")
+                save_metrics_json(metrics_summary, f"best_metrics_fold_{fold_id}.json")
+                print(f"✅ Mejor modelo guardado para fold {fold_id} por mDice")
+
+                print_metric_summary(
+                    metrics_summary,
+                    title=f"Métricas mejores del fold {fold_id}"
+                )
+
+            if use_early_stopping:
+                early_stopper.step(val_mdice)
+
+                print(
+                    f"EarlyStopping | best={early_stopper.best_value:.4f} | "
+                    f"counter={early_stopper.counter}/{early_stopping_patience}"
+                )
+
+                if early_stopper.should_stop:
+                    print(f"⏹️ Early stopping activado en fold {fold_id}, época {epoch}")
+                    break
+
+        all_fold_results.append({
+            "fold": fold_id,
+            "best_val_mdice": best_val_mdice,
+            "best_metrics_summary": best_metrics_summary,
+            "history": history,
+            "train_patients": fold_info["train_patients"],
+            "val_patients": fold_info["val_patients"],
+        })
+
+    best_mdices = [x["best_val_mdice"] for x in all_fold_results]
+    mean_val_mdice = float(np.mean(best_mdices))
+    std_val_mdice = float(np.std(best_mdices))
+
+    print("\n" + "#" * 70)
+    print("RESULTADOS FINALES CROSS-VALIDATION")
+    print("#" * 70)
+
+    for r in all_fold_results:
+        print(f"Fold {r['fold']}: best val mDice = {r['best_val_mdice']:.4f}")
+        if r["best_metrics_summary"] is not None:
+            print(
+                f"  mDice={r['best_metrics_summary']['macro']['mdice']:.4f} | "
+                f"mHD95={r['best_metrics_summary']['macro']['mhd95']:.4f} | "
+                f"mNSD={r['best_metrics_summary']['macro']['mnsd']:.4f} | "
+                f"mPrec={r['best_metrics_summary']['macro']['mprecision']:.4f} | "
+                f"mRec={r['best_metrics_summary']['macro']['mrecall']:.4f} | "
+                f"mVS={r['best_metrics_summary']['macro']['mvs']:.4f}"
+            )
+
+    print(f"Media best val mDice: {mean_val_mdice:.4f}")
+    print(f"Std  best val mDice:  {std_val_mdice:.4f}")
+
+    return all_fold_results
+
+# =========================================================
+# 📂 DATASET INFERENCIA CON META Y BORDES INCLUIDOS
+# =========================================================
+class NRRDTripletDatasetWithMeta(Dataset):
+    """
+    Incluye todos los slices usando padding de bordes.
+    """
+    def __init__(self, img_root, mask_root=None, plane="axial"):
+        self.samples = []
+        self.mask_root = mask_root
+        self.plane = plane
+
+        for patient_id in sorted(os.listdir(img_root)):
+            img_dir = os.path.join(img_root, patient_id, plane)
+            if not os.path.isdir(img_dir):
+                continue
+
+            filenames = sorted([f for f in os.listdir(img_dir) if f.endswith(".nrrd")])
+            if len(filenames) < 1:
+                continue
+
+            mask_dir = None
+            if mask_root is not None:
+                candidate = os.path.join(mask_root, patient_id, plane)
+                if os.path.isdir(candidate):
+                    mask_dir = candidate
+
+            for i in range(len(filenames)):
+                prev_i, center_i, next_i = build_triplet_indices(i, len(filenames))
+
+                prev_name = filenames[prev_i]
+                center_name = filenames[center_i]
+                next_name = filenames[next_i]
+
+                prev_path = os.path.join(img_dir, prev_name)
+                center_path = os.path.join(img_dir, center_name)
+                next_path = os.path.join(img_dir, next_name)
+
+                mask_path = os.path.join(mask_dir, center_name) if mask_dir is not None else None
+
+                self.samples.append({
+                    "patient_id": patient_id,
+                    "slice_name": center_name,
+                    "triplet_paths": [prev_path, center_path, next_path],
+                    "center_img_path": center_path,
+                    "prev_img_path": prev_path,
+                    "next_img_path": next_path,
+                    "mask_path": mask_path,
+                    "slice_index": i,
+                    "num_slices_patient": len(filenames),
+                })
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        sample = self.samples[idx]
+
+        imgs = []
+        for p in sample["triplet_paths"]:
+            arr, _ = nrrd.read(p)
+            imgs.append(arr.astype(np.float32))
+
+        x = torch.from_numpy(np.stack(imgs, axis=0))  # [3,H,W]
+
+        y = None
+        mask_path = sample["mask_path"]
+        if mask_path is not None and os.path.exists(mask_path):
+            m, _ = nrrd.read(mask_path)
+            y = torch.from_numpy(m.astype(np.int64))
+
+        meta = {
+            "patient_id": sample["patient_id"],
+            "slice_name": sample["slice_name"],
+            "center_img_path": sample["center_img_path"],
+            "prev_img_path": sample["prev_img_path"],
+            "next_img_path": sample["next_img_path"],
+            "mask_path": sample["mask_path"],
+            "slice_index": sample["slice_index"],
+            "num_slices_patient": sample["num_slices_patient"],
+        }
+        return x, y, meta
+
+
+# =========================================================
+# 🔌 CARGA MODELOS
+# =========================================================
+def load_single_model(model_path, device, num_classes, use_instance_norm):
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"❌ No encuentro pesos en: {model_path}")
+
+    model = UNet2_5D_Multiclass(
+        n_channels=3,
+        n_classes=num_classes,
+        use_inorm=use_instance_norm
+    ).to(device)
+
+    state = torch.load(model_path, map_location=device)
+    model.load_state_dict(state)
+    model.eval()
+    return model
+
+
+
+def load_ensemble_models(model_paths, device, num_classes, use_instance_norm):
+    models = []
+    for p in model_paths:
+        model = load_single_model(
+            model_path=p,
+            device=device,
+            num_classes=num_classes,
+            use_instance_norm=use_instance_norm
+        )
+        models.append(model)
+        print(f"✅ Modelo cargado: {p}")
+    return models
+
+
+@torch.no_grad()
+def ensemble_predict_logits(models, x, use_amp=True):
+    logits_sum = None
+
+    with torch.cuda.amp.autocast(enabled=use_amp):
+        for model in models:
+            logits = model(x)
+            if logits_sum is None:
+                logits_sum = logits
+            else:
+                logits_sum = logits_sum + logits
+
+    logits_mean = logits_sum / len(models)
+    return logits_mean
+
+
+def save_nrrd_with_original_header(out_path, pred_array, reference_nrrd_path):
+    _, header = nrrd.read(reference_nrrd_path)
+    nrrd.write(out_path, pred_array.astype(np.int16), header=header)
+
+
+# =========================================================
+# 🚀 INFERENCIA CON MÉTRICAS Y SIN "SLICE DONANTE"
+# =========================================================
+@torch.no_grad()
+def run_inference_with_optional_metrics(
+    model_paths,
+    img_root,
+    mask_root=None,
+    output_dir="predicciones_nrrd",
+    zip_path="predicciones_nrrd.zip",
+    plane="axial",
+    save_npy_per_patient=True,
+    save_per_slice_nrrd=True,
+    save_volume_nrrd=True,
+):
+    os.makedirs(output_dir, exist_ok=True)
+
+    models = load_ensemble_models(
+        model_paths=model_paths,
+        device=DEVICE,
+        num_classes=NUM_CLASSES,
+        use_instance_norm=USE_INSTANCE_NORM
+    )
+
+    dataset = NRRDTripletDatasetWithMeta(
+        img_root=img_root,
+        mask_root=mask_root,
+        plane=plane
+    )
+
+    loader = DataLoader(
+        dataset,
+        batch_size=1,
+        shuffle=False,
+        num_workers=0
+    )
+
+    acc = init_metric_accumulator(
+        num_classes=NUM_CLASSES,
+        exclude_background=EXCLUDE_BACKGROUND_IN_METRICS
+    )
+
+    has_masks = False
+    preds_by_patient = defaultdict(list)
+
+    for x, y, meta in loader:
+        x = x.to(DEVICE, non_blocking=True)
+
+        logits_mean = ensemble_predict_logits(models, x, use_amp=USE_AMP)
+        pred = torch.argmax(logits_mean, dim=1).squeeze(0).cpu().numpy().astype(np.int16)
+
+        patient_id = meta["patient_id"][0]
+        slice_name = meta["slice_name"][0]
+        center_img_path = meta["center_img_path"][0]
+        slice_index = int(meta["slice_index"][0])
+
+        preds_by_patient[patient_id].append((slice_index, slice_name, pred, center_img_path))
+
+        if y[0] is not None:
+            y_np = y.squeeze(0).cpu().numpy()
+            pm = compute_metrics_for_single_pair(
+                pred=pred,
+                target=y_np,
+                num_classes=NUM_CLASSES,
+                spacing=DEFAULT_SPACING_2D,
+                exclude_background=EXCLUDE_BACKGROUND_IN_METRICS,
+                nsd_tolerance_mm=NSD_TOLERANCE_MM
+            )
+            update_metric_accumulator(acc, pm)
+            has_masks = True
+
+        if save_per_slice_nrrd:
+            out_patient_dir = os.path.join(output_dir, patient_id, plane)
+            os.makedirs(out_patient_dir, exist_ok=True)
+
+            out_path = os.path.join(out_patient_dir, slice_name)
+            save_nrrd_with_original_header(
+                out_path=out_path,
+                pred_array=pred,
+                reference_nrrd_path=center_img_path
+            )
+
+    # Reconstrucción de volumen completo sin slices donantes:
+    # ya están todos predichos porque el dataset incluye bordes con padding.
+    for patient_id in sorted(preds_by_patient.keys()):
+        entries = sorted(preds_by_patient[patient_id], key=lambda x: x[0])
+
+        reconstructed_slices = [e[2] for e in entries]
+        first_ref = entries[0][3]
+
+        vol = np.stack(reconstructed_slices, axis=0).astype(np.int16)
+
+        if save_npy_per_patient:
+            out_npy_path = os.path.join(output_dir, patient_id, f"{patient_id}_preds.npy")
+            os.makedirs(os.path.dirname(out_npy_path), exist_ok=True)
+            np.save(out_npy_path, vol)
+
+        if save_volume_nrrd:
+            _, header = nrrd.read(first_ref)
+            volume_out_path = os.path.join(output_dir, patient_id, f"{patient_id}_preds_volume.nrrd")
+            nrrd.write(volume_out_path, vol, header=header)
+
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for root, _, files in os.walk(output_dir):
+            for f in files:
+                if f.endswith(".nrrd") or f.endswith(".npy"):
+                    full = os.path.join(root, f)
+                    arc = os.path.relpath(full, output_dir)
+                    zf.write(full, arcname=arc)
+
+    print("✅ Inferencia ensemble completada.")
+    print(f"📂 Salida: {output_dir}")
+    print(f"🗜️ ZIP: {zip_path}")
+
+    if has_masks:
+        summary = finalize_metric_accumulator(acc)
+        print_metric_summary(summary, title="Métricas inferencia con máscaras")
+        save_metrics_json(summary, os.path.join(output_dir, "metrics_summary.json"))
+        return summary
+
+    return None
+
+
+# =========================================================
+# 🧪 DATASET TEST CON BORDES INCLUIDOS
+# =========================================================
+class TestNRRDTripletDataset(Dataset):
+    """
+    Estructura:
+      IMG_TEST_ROOT/paciente/axial/*.nrrd
+
+    Incluye todos los slices, también bordes, con padding.
+    """
+    def __init__(self, image_root, plane="axial"):
+        self.samples = []
+        self.plane = plane
+
+        for patient_id in sorted(os.listdir(image_root)):
+            img_dir = os.path.join(image_root, patient_id, plane)
+            if not os.path.isdir(img_dir):
+                continue
+
+            filenames = sorted([f for f in os.listdir(img_dir) if f.endswith(".nrrd")])
+            if len(filenames) < 1:
+                continue
+
+            for i in range(len(filenames)):
+                prev_i, center_i, next_i = build_triplet_indices(i, len(filenames))
+
+                prev_name = filenames[prev_i]
+                center_name = filenames[center_i]
+                next_name = filenames[next_i]
+
+                prev_path = os.path.join(img_dir, prev_name)
+                center_path = os.path.join(img_dir, center_name)
+                next_path = os.path.join(img_dir, next_name)
+
+                self.samples.append({
+                    "patient_id": patient_id,
+                    "filename": center_name,
+                    "slice_index": i,
+                    "prev_path": prev_path,
+                    "center_path": center_path,
+                    "next_path": next_path,
+                })
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        sample = self.samples[idx]
+
+        imgs = []
+        for p in [sample["prev_path"], sample["center_path"], sample["next_path"]]:
+            arr, _ = nrrd.read(p)
+            imgs.append(arr.astype(np.float32))
+
+        x = torch.from_numpy(np.stack(imgs, axis=0))
+
+        meta = {
+            "filename": sample["filename"],
+            "patient_id": sample["patient_id"],
+            "slice_index": sample["slice_index"],
+            "center_path": sample["center_path"],
+            "prev_path": sample["prev_path"],
+            "next_path": sample["next_path"],
+        }
+        return x, meta
+
+
+# =========================================================
+# 🚀 TEST INFERENCE COMPLETA
+# =========================================================
+@torch.no_grad()
+def run_test_inference(
+    model_paths,
+    img_test_root,
+    out_dir="predicciones_test_nrrd",
+    plane="axial",
+    save_npy_per_patient=True,
+    save_volume_nrrd=True,
+):
+    os.makedirs(out_dir, exist_ok=True)
+
+    models = load_ensemble_models(
+        model_paths=model_paths,
+        device=DEVICE,
+        num_classes=NUM_CLASSES,
+        use_instance_norm=USE_INSTANCE_NORM
+    )
+
+    test_ds = TestNRRDTripletDataset(img_test_root, plane=plane)
+    test_loader = DataLoader(test_ds, batch_size=1, shuffle=False, num_workers=0)
+
+    preds_by_patient = defaultdict(list)
+
+    for x, meta in test_loader:
+        x = x.to(DEVICE, non_blocking=True)
+
+        logits = ensemble_predict_logits(models, x, use_amp=USE_AMP)
+        pred = torch.argmax(logits, dim=1).squeeze(0).cpu().numpy().astype(np.int16)
+
+        patient_id = meta["patient_id"][0]
+        filename = meta["filename"][0]
+        center_path = meta["center_path"][0]
+        slice_index = int(meta["slice_index"][0])
+
+        out_folder = os.path.join(out_dir, patient_id, plane)
+        os.makedirs(out_folder, exist_ok=True)
+
+        out_path = os.path.join(out_folder, filename)
+
+        _, header = nrrd.read(center_path)
+        nrrd.write(out_path, pred, header=header)
+
+        preds_by_patient[patient_id].append((slice_index, pred, center_path))
+
+    for patient_id in sorted(preds_by_patient.keys()):
+        entries = sorted(preds_by_patient[patient_id], key=lambda x: x[0])
+        vol = np.stack([e[1] for e in entries], axis=0).astype(np.int16)
+        first_ref = entries[0][2]
+
+        if save_npy_per_patient:
+            out_npy_path = os.path.join(out_dir, patient_id, f"{patient_id}_preds.npy")
+            os.makedirs(os.path.dirname(out_npy_path), exist_ok=True)
+            np.save(out_npy_path, vol)
+
+        if save_volume_nrrd:
+            _, header = nrrd.read(first_ref)
+            volume_out_path = os.path.join(out_dir, patient_id, f"{patient_id}_preds_volume.nrrd")
+            nrrd.write(volume_out_path, vol, header=header)
+
+    print(f"✅ Predicciones completas guardadas en: {out_dir}")
+
+results = run_4fold_cross_validation(
+    dataset=dataset,
+    device=DEVICE,
+    num_classes=NUM_CLASSES,
+    use_instance_norm=USE_INSTANCE_NORM,
+    epochs=15,
+    batch_size=8,
+    num_workers=2,
+    seed=42,
+    use_early_stopping=True,
+    early_stopping_patience=5,
+    early_stopping_min_delta=1e-4
+)
