@@ -20,7 +20,7 @@ Desarrollo de un sistema de segmentación multiclase de TAC de tórax mediante *
 Split: 40 entrenamiento / 20 test.
 
 ## Estructura del repositorio
-´´
+´´´
 ├── preprocesado/       # Remuestreo, normalización y exportación del dataset 2.5D
 ├── clase_piel/         # Generación de la máscara de piel
 ├── redes/
@@ -30,4 +30,4 @@ Split: 40 entrenamiento / 20 test.
 │   └── resunet_con_da/     # ResUNet 2.5D con data augmentation
 ├── mallado/            # Generación de mallas 3D con Marching Cubes
 └── DATASET_2p5D_bases_FINAL/   # Dataset preprocesado
-´´
+´´´
