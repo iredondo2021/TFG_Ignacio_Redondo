@@ -29,5 +29,6 @@ Split: 40 entrenamiento / 20 test.
 │   ├── U-Net 2.5D con data augmentation/     # ResUNet 2.5D sin data augmentation
 │   └── U-Net 2.5D sin data augmentation/     # ResUNet 2.5D con data augmentation
 ├── MALLADO/            # Generación de mallas 3D con Marching Cubes
-└── DATASET_2p5D_bases_FINAL/   # Dataset preprocesado
+└── DATASET_2p5D_bases_FINAL/   # Dataset preprocesado (disponible en Kaggle)
 ```
+El dataset preprocesado está disponible en Kaggle: [DATASET_2p5D_bases_FINAL](https://www.kaggle.com/datasets/ignacioredondo/dataset-2p5d-bases-final)
